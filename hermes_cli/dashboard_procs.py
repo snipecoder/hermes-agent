@@ -802,6 +802,11 @@ def _hermes_home_dir() -> Path:
     return Path.home() / ".hermes"
 
 
+def _desktop_ssh_runtime_root() -> Path:
+    """Machine-scoped SSH ownership root, independent of profile HERMES_HOME."""
+    return Path.home() / ".hermes" / _REMOTE_LOCK_SUBDIR
+
+
 def _valid_lockfile_payload(parsed: object, ownership_id: str) -> bool:
     """Validate a parsed ``backend.lock.json`` body, mirroring readLockfile().
 
@@ -860,9 +865,7 @@ def _lock_owned_serve_pids(base_dir: Path | None = None) -> set[int]:
     """
     import json
 
-    root = base_dir if base_dir is not None else (
-        _hermes_home_dir() / _REMOTE_LOCK_SUBDIR
-    )
+    root = base_dir if base_dir is not None else _desktop_ssh_runtime_root()
     owned: set[int] = set()
     if not root.is_dir():
         return owned
