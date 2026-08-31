@@ -19524,12 +19524,21 @@ def start_server(
     # request middleware never reloads config. Any non-loopback public hostname
     # engages the auth gate even when the backend itself remains on loopback;
     # otherwise the SPA's local session token would become remotely reachable.
-    app.state.trusted_public_hosts = _dashboard_public_hosts()
+    #
+    # Desktop SSH is a distinct, validated bootstrap path: the CLI reads and
+    # unlinks a one-shot token from the machine-scoped desktop-ssh runtime before
+    # calling this function. A headless loopback serve launched that way must use
+    # token mode even if its profile inherited the machine dashboard's public_url;
+    # the SSH tunnel is the only transport and no SPA is mounted.
+    _ssh_token_loopback = bool(ssh_session_token) and headless and host in _LOOPBACK_HOST_VALUES
+    app.state.trusted_public_hosts = (
+        frozenset() if _ssh_token_loopback else _dashboard_public_hosts()
+    )
     # Stash the auth-gate flag on app.state so middleware / SPA-token injection /
     # WS-auth paths can branch on it consistently. It also decides whether to
     # refuse startup, log the gate-on banner, and enable uvicorn proxy_headers.
-    app.state.auth_required = should_require_dashboard_auth(
-        host, app.state.trusted_public_hosts
+    app.state.auth_required = False if _ssh_token_loopback else (
+        should_require_dashboard_auth(host, app.state.trusted_public_hosts)
     )
 
     # ``--insecure`` no longer disables the auth gate (June 2026 hardening:

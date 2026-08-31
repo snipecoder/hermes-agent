@@ -167,6 +167,30 @@ def test_start_server_loopback_sets_auth_required_false(monkeypatch):
     assert web_server.app.state.auth_required is False
 
 
+def test_start_server_ssh_token_overrides_profile_public_url_gate(monkeypatch):
+    """A validated SSH token owns an isolated loopback serve, even when the
+    profile inherited the machine dashboard's public_url declaration."""
+    _stub_uvicorn_run(monkeypatch)
+    monkeypatch.setattr(
+        web_server,
+        "_dashboard_public_hosts",
+        lambda: frozenset({"os.cloudwish.com"}),
+    )
+    web_server.app.state.auth_required = None
+
+    web_server.start_server(
+        host="127.0.0.1",
+        port=0,
+        open_browser=False,
+        allow_public=False,
+        headless=True,
+        ssh_session_token="a" * 64,
+    )
+
+    assert web_server.app.state.auth_required is False
+    assert web_server.app.state.trusted_public_hosts == frozenset()
+
+
 def test_start_server_insecure_public_no_longer_bypasses_gate(monkeypatch):
     """``--insecure`` (allow_public=True) on a public host: gate now ENGAGES.
 
