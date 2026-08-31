@@ -3033,13 +3033,16 @@ from gateway.shutdown_watchdog import (
 )
 from gateway.restart import (
     DEFAULT_GATEWAY_CRON_DRAIN_TIMEOUT,
+    DEFAULT_GATEWAY_POST_INTERRUPT_GRACE_TIMEOUT,
     DEFAULT_GATEWAY_RESTART_AFTER_TURN_TIMEOUT,
     DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT,
+    DEFAULT_GATEWAY_SIGNAL_INTERRUPT_GRACE_TIMEOUT,
     GATEWAY_FATAL_CONFIG_EXIT_CODE,
     GATEWAY_SERVICE_RESTART_EXIT_CODE,
     parse_cron_drain_timeout,
     parse_restart_after_turn_timeout,
     parse_restart_drain_timeout,
+    parse_signal_interrupt_grace_timeout,
     resolve_cron_drain_budget,
 )
 
@@ -7298,6 +7301,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     _restart_drain_timeout: float = DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT
     _restart_after_turn_timeout: float = DEFAULT_GATEWAY_RESTART_AFTER_TURN_TIMEOUT
     _cron_drain_timeout: float = DEFAULT_GATEWAY_CRON_DRAIN_TIMEOUT
+    _signal_interrupt_grace_timeout: float = (
+        DEFAULT_GATEWAY_SIGNAL_INTERRUPT_GRACE_TIMEOUT
+    )
     _exit_code: Optional[int] = None
     _draining: bool = False
     _external_drain_active: bool = False
@@ -7447,6 +7453,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self._restart_drain_timeout = self._load_restart_drain_timeout()
         self._restart_after_turn_timeout = self._load_restart_after_turn_timeout()
         self._cron_drain_timeout = self._load_cron_drain_timeout()
+        self._signal_interrupt_grace_timeout = (
+            self._load_signal_interrupt_grace_timeout()
+        )
         self._provider_routing = self._load_provider_routing()
         self._fallback_model = self._load_fallback_model()
 
@@ -10418,6 +10427,46 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     DEFAULT_GATEWAY_CRON_DRAIN_TIMEOUT,
                 )
         return value
+
+    @staticmethod
+    def _load_signal_interrupt_grace_timeout() -> float:
+        """Load the unexpected-signal post-interrupt grace in seconds."""
+        cfg = _load_gateway_runtime_config()
+        raw = cfg_get(
+            cfg,
+            "gateway",
+            "signal_interrupt_grace_timeout",
+            default=None,
+        )
+        value = parse_signal_interrupt_grace_timeout(raw)
+        if raw is not None and raw != "":
+            try:
+                float(raw)
+            except (TypeError, ValueError):
+                logger.warning(
+                    "Invalid signal_interrupt_grace_timeout '%s', using default %.0fs",
+                    raw,
+                    DEFAULT_GATEWAY_SIGNAL_INTERRUPT_GRACE_TIMEOUT,
+                )
+        return value
+
+    def _post_interrupt_grace_timeout(self) -> float:
+        """Return the grace before teardown after forcibly interrupting agents."""
+        if (
+            getattr(self, "_signal_initiated_shutdown", False)
+            and not getattr(self, "_restart_requested", False)
+        ):
+            return max(
+                0.0,
+                float(
+                    getattr(
+                        self,
+                        "_signal_interrupt_grace_timeout",
+                        DEFAULT_GATEWAY_SIGNAL_INTERRUPT_GRACE_TIMEOUT,
+                    )
+                ),
+            )
+        return DEFAULT_GATEWAY_POST_INTERRUPT_GRACE_TIMEOUT
 
     @staticmethod
     def _load_background_notifications_mode() -> str:
@@ -16173,7 +16222,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 self._interrupt_running_agents(
                     _INTERRUPT_REASON_GATEWAY_RESTART if self._restart_requested else _INTERRUPT_REASON_GATEWAY_SHUTDOWN
                 )
-                interrupt_deadline = asyncio.get_running_loop().time() + 5.0
+                interrupt_grace_timeout = (
+                    GatewayRunner._post_interrupt_grace_timeout(self)
+                )
+                interrupt_deadline = (
+                    asyncio.get_running_loop().time() + interrupt_grace_timeout
+                )
+                logger.info(
+                    "Shutdown phase: allowing %.1fs for interrupted agents to unwind",
+                    interrupt_grace_timeout,
+                )
                 # Wait on API-server work too. The interrupt is cooperative:
                 # without this the settle window closes the instant
                 # _running_agents is empty, and an API turn that was just asked
@@ -32264,6 +32322,45 @@ async def _await_thread_exit(
     return not thread.is_alive()
 
 
+async def _shutdown_mcp_servers_nonblocking(timeout: float = 5.0) -> bool:
+    """Close MCP servers off-loop with a bounded wait (#82874).
+
+    ``shutdown_mcp_servers()`` is synchronous and can block for its full
+    internal 15s future wait when the MCP loop and its stdio children are
+    torn down concurrently (every process in the tree gets SIGTERM at once
+    under a container/supervisor stop). Calling it directly from the gateway
+    event-loop thread freezes the loop for that whole window, so supervisors
+    with a shorter kill grace (s6-overlay defaults to 3s) SIGKILL the gateway
+    before ``lifecycle_ledger.mark_exited()`` runs and every subsequent boot
+    reports a phantom unclean death.
+
+    Run it on a daemon thread instead and poll with ``_await_thread_exit`` so
+    the loop keeps servicing teardown. If it does not finish within
+    ``timeout`` we proceed with shutdown; the daemon thread is left to finish
+    (or die with the process) in the background. Returns True when the MCP
+    shutdown completed within the budget.
+    """
+
+    def _do() -> None:
+        try:
+            from tools.mcp_tool import shutdown_mcp_servers
+
+            shutdown_mcp_servers()
+        except Exception:
+            logger.debug("MCP shutdown raised", exc_info=True)
+
+    thread = threading.Thread(target=_do, name="mcp-shutdown", daemon=True)
+    thread.start()
+    done = await _await_thread_exit(thread, timeout=timeout)
+    if not done:
+        logger.warning(
+            "MCP shutdown did not finish within %.1fs; continuing gateway "
+            "teardown (background thread will be reaped at process exit)",
+            timeout,
+        )
+    return done
+
+
 def _shutdown_gateway_health_export(runner: Any) -> None:
     """Idempotently drain and detach Gateway Health OTLP export."""
     runtime = getattr(runner, "_gateway_health_export_runtime", None)
@@ -33057,8 +33154,7 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
                     logger.error("Gateway exiting with failure: %s", runner.exit_reason)
                 return False
             try:
-                from tools.mcp_tool import shutdown_mcp_servers
-                shutdown_mcp_servers()
+                await _shutdown_mcp_servers_nonblocking()
             except Exception:
                 pass
             if runner.exit_code is not None:
@@ -33238,10 +33334,9 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     _planned_stop_watcher_stop.set()
     _planned_stop_watcher_thread.join(timeout=2)
 
-    # Close MCP server connections
+    # Close MCP server connections (off-loop, bounded — #82874)
     try:
-        from tools.mcp_tool import shutdown_mcp_servers
-        shutdown_mcp_servers()
+        await _shutdown_mcp_servers_nonblocking()
     except Exception:
         pass
 
